@@ -13,4 +13,10 @@ while IFS= read -r p; do
   cp -a "$PORT_DIR/$p" "$OUT_DIR/$p"
 done < "$REPO_ROOT/port-paths.txt"
 cp -a "$REPO_ROOT/overlay"/. "$OUT_DIR"/
+# Branding: original Folia look (black icon with white F + themed splashes).
+# PNGs travel as base64 text because the push channel is text-only.
+for f in icon splash-light splash-dark; do
+  openssl base64 -d -in "$REPO_ROOT/branding/$f.png.b64" -out "$OUT_DIR/resources/$f.png"
+  echo "branding $f.png: $(md5 -q "$OUT_DIR/resources/$f.png")"
+done
 echo "merge done"
