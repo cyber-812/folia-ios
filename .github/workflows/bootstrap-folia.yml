@@ -1,32 +1,10 @@
-# ============================================================================
-# Bootstrap: 把 chuyiqi747/folia-ios 的源码导入本仓库，并在 macOS 上构建未签名 IPA
-#
-# 为什么需要这个文件：
-#   本仓库由自动化工具创建时只有一个空壳。第一个 job 从公开上游仓库拉取源码
-#   并提交到 main（等效 fork）；第二个 job 镜像上游 .github/workflows/
-#   build-ios-ipa.yml 的步骤完成构建，并把 IPA 与日志作为 GitHub Release
-#   附件发布 —— Release 附件对公开仓库可匿名下载，便于外部工具回读产物，
-#   不依赖 Actions artifact 的登录下载。
-#
-# 注意：
-#   - 上游的 .github/workflows/* 没有导入：GITHUB_TOKEN 无权推送 workflow
-#     文件（缺 workflows 权限会被 API 拒绝）。构建步骤已内联在本文件里，
-#     与上游工作流走同一批脚本（scripts/build-ios-unsigned.sh 等）。
-#   - VITE_NETEASE_API_BASE 是公开的后端地址，不是密钥，所以直接写 env；
-#     其余 VITE_* 音源未配置（可选功能，构建不依赖）。
-# ============================================================================
-
-name: Bootstrap Folia iOS
+name: Build Folia iOS (merged latest web + iOS shell)
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/bootstrap-folia.yml'
   workflow_dispatch:
     inputs:
       adhoc_sign:
-        description: '给 IPA 加 ad-hoc 签名（TrollStore 报 Unsigned App 时才需要）'
+        description: 'ad-hoc sign the IPA (only if TrollStore reports Unsigned App)'
         type: boolean
         default: false
 
@@ -34,144 +12,117 @@ permissions:
   contents: write
 
 concurrency:
-  group: bootstrap-folia
+  group: folia-merged-build
   cancel-in-progress: false
 
 jobs:
-  import-source:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    outputs:
-      upstream_sha: ${{ steps.upstream.outputs.sha }}
-    steps:
-      - name: 拉取本仓库
-        uses: actions/checkout@v4
-
-      - name: 克隆上游 folia-ios
-        id: upstream
-        run: |
-          git clone https://github.com/chuyiqi747/folia-ios.git /tmp/upstream
-          echo "sha=$(git -C /tmp/upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: 导入源码到 main（排除上游 CI workflow 文件）
-        run: |
-          rsync -a --exclude='.git' --exclude='.github/workflows' /tmp/upstream/ ./
-          git config user.name 'folia-ci'
-          git config user.email 'folia-ci@localhost'
-          git add -A
-          if git diff --cached --quiet; then
-            echo '源码无变化，跳过提交'
-          else
-            git commit -m "Import chuyiqi747/folia-ios snapshot (${{ steps.upstream.outputs.sha }})"
-            git push origin HEAD:main
-          fi
-
   build-ipa:
-    needs: import-source
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
-      - name: 拉取代码（含刚导入的源码）
+      - name: Checkout merge kit
         uses: actions/checkout@v4
-        with:
-          ref: main
 
-      - name: 安装 Node 24
+      - name: Clone web base (pinned)
+        run: |
+          git clone https://github.com/cyber-812/folia-major.git /tmp/base
+          git -C /tmp/base checkout d7acc982cdebf1f23929fcf2ab48a8cccbd5942e
+
+      - name: Clone iOS port layer (pinned)
+        run: |
+          git clone https://github.com/chuyiqi747/folia-ios.git /tmp/port
+          git -C /tmp/port checkout f79066083d5847b8e1a89678e1e3f4d8fd75fc59
+
+      - name: Merge trees
+        run: bash ci-merge.sh /tmp/base /tmp/port "$GITHUB_WORKSPACE" /tmp/app
+
+      - name: Setup Node 24
         uses: actions/setup-node@v4
         with:
           node-version: '24'
-          cache: npm
 
-      - name: 选择最新 Xcode
+      - name: Select latest Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      - name: 打印工具链版本
+      - name: Toolchain versions
         run: |
           xcodebuild -version
           node --version
           npm --version
 
-      - name: 安装依赖
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            npm install
-          fi
+      - name: Install dependencies
+        working-directory: /tmp/app
+        run: npm ci
 
-      - name: 构建 Web 产物（注入网易云 API 地址，构建时内联）
+      - name: Build web bundle (capacitor)
+        working-directory: /tmp/app
         run: npm run build:capacitor
         env:
           VITE_NETEASE_API_BASE: 'https://netease-api-t559.onrender.com'
 
-      - name: 生成 iOS 工程（仓库未提交 ios/ 时）
-        run: |
-          if [ ! -d ios ]; then
-            npx cap add ios
-          else
-            echo '复用仓库里已有的 ios/'
-          fi
-
-      - name: 同步 iOS 平台
+      - name: Sync iOS platform
+        working-directory: /tmp/app
         run: npx cap sync ios
 
-      - name: 规范化 iOS SPM 清单路径
+      - name: Fix iOS SPM paths
+        working-directory: /tmp/app
         run: node scripts/fix-ios-spm-paths.mjs
 
-      - name: 生成 iOS 图标与启动图（失败不阻断）
+      - name: Generate iOS assets (non-blocking)
+        working-directory: /tmp/app
         continue-on-error: true
         run: node scripts/generate-ios-assets.mjs
 
-      - name: 写入 Info.plist 权限声明
+      - name: Apply Info.plist entries
+        working-directory: /tmp/app
         run: bash scripts/apply-ios-plist.sh
 
-      - name: 校验原生插件注册（13 项）
+      - name: Verify native plugin registration
+        working-directory: /tmp/app
         run: node scripts/verify-ios-plugin.mjs
 
-      - name: 编译并打包未签名 IPA
+      - name: Build unsigned IPA
+        working-directory: /tmp/app
         run: bash scripts/build-ios-unsigned.sh
         env:
           FOLIA_ADHOC_SIGN: ${{ inputs.adhoc_sign && '1' || '0' }}
 
-      - name: 上传 IPA（Actions artifact，用户也可在网页下载）
+      - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: folia-unsigned-ipa
-          path: build/Folia-unsigned.ipa
+          name: folia-merged-unsigned-ipa
+          path: /tmp/app/build/Folia-unsigned.ipa
           retention-days: 30
           if-no-files-found: error
 
-      - name: 上传构建日志（失败时）
+      - name: Upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: xcodebuild-log
-          path: build/xcodebuild.log
+          path: /tmp/app/build/xcodebuild.log
           retention-days: 7
           if-no-files-found: ignore
 
-      # 无论成败都发一个 Release：成功带 IPA，失败带日志。
-      # 公开仓库的 Release 附件可匿名下载，外部工具据此回读结果。
-      - name: 发布结果到 Release（IPA + 日志 + 状态）
+      - name: Publish result to Release
         if: always()
+        working-directory: /tmp/app
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p build
           {
-            echo "bootstrap run: ${{ github.run_id }} / #${{ github.run_number }}"
+            echo "merged build run: ${{ github.run_id }} / #${{ github.run_number }}"
             echo "build job status: ${{ job.status }}"
-            echo "upstream: chuyiqi747/folia-ios@${{ needs.import-source.outputs.upstream_sha }}"
+            echo "web base: cyber-812/folia-major@d7acc982cdebf1f23929fcf2ab48a8cccbd5942e"
+            echo "ios port: chuyiqi747/folia-ios@f79066083d5847b8e1a89678e1e3f4d8fd75fc59"
             echo "netease api: https://netease-api-t559.onrender.com"
+            echo "ai api: https://folia-ai-api-soxq.onrender.com"
           } > build/ci-status.txt
           files=(build/ci-status.txt)
           [ -f build/Folia-unsigned.ipa ] && files+=(build/Folia-unsigned.ipa)
           [ -f build/xcodebuild.log ] && files+=(build/xcodebuild.log)
-          tag="ipa-run-${{ github.run_number }}"
-          gh release create "$tag" --target main \
-            --title "Folia iOS unsigned IPA (run ${{ github.run_number }})" \
-            --notes "Automated bootstrap build. See ci-status.txt inside for outcome." \
-            "${files[@]}" \
-          || gh release upload "$tag" "${files[@]}" --clobber
+          tag="merged-run-${{ github.run_number }}"
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target main --title "Folia iOS merged unsigned IPA (run ${{ github.run_number }})" --notes "Merged build: latest web Folia + iOS shell. See ci-status.txt." "${files[@]}" || gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "${files[@]}" --clobber
