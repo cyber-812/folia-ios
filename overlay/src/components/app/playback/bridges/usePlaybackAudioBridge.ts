@@ -22,6 +22,7 @@ import { setPlayerState, setReplayGainAppliedDb, setReplayGainEstimated } from '
 import { useTranslation } from 'react-i18next';
 import { usePlaybackStore } from '../../../../stores/usePlaybackStore';
 import { resolveHeardAudioEqualizerSettings } from '../../../../utils/audioEqualizerModCurve';
+import { isCapacitorIOS } from '../../../../platform/runtime';
 
 // src/components/app/playback/bridges/usePlaybackAudioBridge.ts
 
@@ -365,7 +366,12 @@ export function usePlaybackAudioBridge({
             // source runs this effect again, and that run is the one meant to start it.
             if (audioRef.current.error) return;
 
-            if (shouldAutoPlayRef.current && !isLyricsLoading) {
+            // iOS lock-screen skip fix: on Capacitor iOS, do not let lyrics loading hold the
+            // deck hostage. In the background the (already silenced) deck gives the WebView only
+            // a short grace period; if the lyrics pipeline has not finished by then the process
+            // is suspended mid-load and play() never runs, so background next/previous appears
+            // dead. Lyrics still land through their own callbacks and sync to the audio clock.
+            if (shouldAutoPlayRef.current && (!isLyricsLoading || isCapacitorIOS())) {
                 // The deck has its source and is buffering, but its blend is not due yet. Bail
                 // WITHOUT spending the intent - this effect runs again when the hold lifts, and
                 // that run is the one meant to start it.
