@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="description" content="一个动态歌词播放器，支持 AI 主题生成" />
+    <meta name="theme-color" content="#09090b" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Folia" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <title>Folia</title>
+    <script src="/runtime-config.js"></script>
+    <!--
+      老系统运行时 API 兜底（polyfill）
+      ==================================================================
+      为什么要加：Info.plist 的 MinimumOSVersion 是 15.0，而打包目标只能保证
+      「语法」被降级，运行时的原型方法不会被自动补。下面这几个方法在旧 WebKit 上
+      根本不存在，一旦被调用就是 TypeError（而且往往发生在渲染期 -> 黑屏）。
+
+      全部用「不存在才补」的方式，不影响新系统；也不依赖任何新语法。
+      ==================================================================
+    -->
+    <script>
+      (function () {
+        function def(target, name, fn) {
+          if (!target || typeof target !== 'object' && typeof target !== 'function') { return; }
+          if (target[name]) { return; }
+          try {
+            Object.defineProperty(target, name, {
+              value: fn, writable: true, enumerable: false, configurable: true
+            });
+          } catch (e) { /* ignore */ }
+        }
+
+        // Safari 15.4+
+        def(Array.prototype, 'at', function (n) {
+          n = Math.trunc(n) || 0;
+          if (n < 0) { n += this.length; }
+          return (n < 0 || n >= this.length) ? undefined : this[n];
+        });
+        def(String.prototype, 'at', function (n) {
+          n = Math.trunc(n) || 0;
+          if (n < 0) { n += this.length; }
+          return (n < 0 || n >= this.length) ? undefined : this.charAt(n);
+        });
+        def(Object, 'hasOwn', function (obj, key) {
+          return Object.prototype.hasOwnProperty.call(Object(obj), key);
+        });
+        def(Array.prototype, 'findLast', function (fn, thisArg) {
+          for (var i = this.length - 1; i >= 0; i--) {
+            if (fn.call(thisArg, this[i], i, this)) { return this[i]; }
+          }
+          return undefined;
+        });
+        def(Array.prototype, 'findLastIndex', function (fn, thisArg) {
+          for (var i = this.length - 1; i >= 0; i--) {
+            if (fn.call(thisArg, this[i], i, this)) { return i; }
+          }
+          return -1;
+        });
+
+        // Safari 16.4+
+        def(Array.prototype, 'toSorted', function (fn) {
+          return Array.prototype.slice.call(this).sort(fn);
+        });
+        def(Array.prototype, 'toReversed', function () {
+          return Array.prototype.slice.call(this).reverse();
+        });
+        def(Array.prototype, 'toSpliced', function () {
+          var copy = Array.prototype.slice.call(this);
+          return copy.splice.apply(copy, Array.prototype.slice.call(arguments));
+        });
+        def(Array.prototype, 'with', function (index, value) {
+          var copy = Array.prototype.slice.call(this);
+          var i = Math.trunc(index) || 0;
+          if (i < 0) { i += copy.length; }
+          if (i < 0 || i >= copy.length) { throw new RangeError('Invalid index'); }
+          copy[i] = value;
+          return copy;
+        });
+
+        // Safari 17.4+
+        def(Promise, 'withResolvers', function () {
+          var resolve, reject;
+          var promise = new Promise(function (res, rej) { resolve = res; reject = rej; });
+          return { promise: promise, resolve: resolve, reject: reject };
+        });
+
+        // Safari 15.4+（浅拷贝即可，够用）
+        if (typeof globalThis !== 'undefined' && !globalThis.structuredClone) {
+          try {
+            globalThis.structuredClone = function (value) {
+              if (value === undefined || value === null) { return value; }
+              if (typeof value !== 'object') { return value; }
+              try { return JSON.parse(JSON.stringify(value)); } catch (e) { return value; }
+            };
+          } catch (e) { /* ignore */ }
+        }
+      })();
+    </script>
+
+    <!--
+      诊断覆盖层（diagnostic overlay）
+      ==================================================================
+      为什么加：iOS 上没有 Safari 远程调试就用不了 Web Inspector，一旦 JS
+      在启动阶段抛错，界面会直接黑屏且【没有任何提示】，完全没法定位。
+      这段脚本是纯内联的，在 React 之前执行，所以即使打包出来的 bundle
+      整个挂掉，它依然能工作并把错误显示在屏幕上（截图即可排查）。
+
+      它做三件事：
+        1. 显示真正的错误 name / message（不是只显示 [native code] 堆栈）
+        2. 列出所有已加载的 js/css 资源及其 HTTP 状态与体积
+        3. 出错后自动重新 fetch 一次 bootstrap 模块，报告 HTTP 状态、
+           MIME 类型、正文长度与开头内容
+           —— 用来区分「文件没加载上」和「文件加载了但解析不了」
+
+      排查完成后可以整段删掉，不影响任何功能。
+      ==================================================================
+    -->
+    <script>
+      (function () {
+        var shown = false;
+        var bodyEl = null;
+        var titleEl = null;
+
+        function ensureBox(kind) {
+          if (shown) { return; }
+          shown = true;
+
+          var box = document.createElement('div');
+          box.id = '__folia_diagnostic__';
+          box.style.cssText = [
+            'position:fixed', 'top:0', 'left:0', 'right:0', 'bottom:0',
+            'z-index:2147483647', 'background:#1a0000', 'color:#ffc9c9',
+            'font:11px/1.5 ui-monospace,Menlo,Consolas,monospace',
+            'padding:16px', 'padding-top:52px', 'overflow:auto',
+            'white-space:pre-wrap', 'word-break:break-all',
+            '-webkit-user-select:text', 'user-select:text'
+          ].join(';');
+
+          titleEl = document.createElement('div');
+          titleEl.style.cssText = 'font-size:16px;font-weight:700;color:#ff8a8a;margin-bottom:10px';
+          titleEl.textContent = '\u26a0\ufe0f Folia \u542f\u52a8\u5931\u8d25';
+
+          var sub = document.createElement('div');
+          sub.style.cssText = 'font-size:12px;color:#ffb4b4;margin-bottom:14px';
+          sub.textContent = kind + ' \u2014\u2014 \u8bf7\u622a\u56fe\u53d1\u7ed9\u6211';
+
+          bodyEl = document.createElement('div');
+
+          var env = document.createElement('div');
+          env.style.cssText = 'margin-top:18px;padding-top:12px;border-top:1px solid #552222;opacity:.75';
+          env.textContent = 'UA: ' + navigator.userAgent;
+
+          box.appendChild(titleEl);
+          box.appendChild(sub);
+          box.appendChild(bodyEl);
+          box.appendChild(env);
+          (document.body || document.documentElement).appendChild(box);
+        }
+
+        function append(text) {
+          try {
+            if (!bodyEl) { return; }
+            var d = document.createElement('div');
+            d.textContent = text;
+            bodyEl.appendChild(d);
+          } catch (e) { /* ignore */ }
+        }
+
+        // 已经加载过的 js/css 清单。
+        // 用来区分两种完全不同的故障：
+        //   - 文件压根没请求到 / 404  -> 清单里没有它
+        //   - 文件拿到了但解析不了     -> 清单里有它，且体积正常
+        function resourceReport() {
+          try {
+            var entries = performance.getEntriesByType('resource') || [];
+            var lines = [];
+            for (var i = 0; i < entries.length; i++) {
+              var e = entries[i];
+              if (!e.name || (e.name.indexOf('.js') === -1 && e.name.indexOf('.css') === -1)) { continue; }
+              var status = (typeof e.responseStatus === 'number' && e.responseStatus)
+                ? String(e.responseStatus) : '?';
+              var size = Math.round(e.transferSize || e.decodedBodySize || 0);
+              lines.push(status + '  ' + size + 'B  ' + e.name.replace(location.origin, ''));
+            }
+            return lines.length ? lines.join('\n') : '(\u6ca1\u6709\u4efb\u4f55 js/css \u8d44\u6e90\u8bb0\u5f55)';
+          } catch (e) {
+            return '(\u65e0\u6cd5\u8bfb\u53d6\u8d44\u6e90\u8bb0\u5f55: ' + e + ')';
+          }
+        }
+
+        // 关键修正：之前优先显示 stack，而 JavaScriptCore 的 stack 全是
+        // [native code]，把真正的 message 藏掉了。现在 name/message 放最前面。
+        function describe(err) {
+          if (err === null || err === undefined) { return '(empty)'; }
+          var parts = [];
+          try {
+            var name = (err && err.name) ? String(err.name) : '';
+            var msg = (err && err.message) ? String(err.message) : '';
+            if (name || msg) { parts.push('\u3010' + (name || 'Error') + '\u3011' + msg); }
+          } catch (e) { /* ignore */ }
+          try { if (err && err.stack) { parts.push('\n--- stack ---\n' + String(err.stack)); } } catch (e) { /* ignore */ }
+          try {
+            var json = JSON.stringify(err);
+            if (json && json !== '{}') { parts.push('\n--- json ---\n' + json); }
+          } catch (e) { /* ignore */ }
+          if (!parts.length) {
+            try { parts.push(String(err)); } catch (e) { parts.push('(unprintable)'); }
+          }
+          return parts.join('\n');
+        }
+
+        // 出错后重新拉一次 bootstrap 模块，报告响应头与正文开头。
+        // 这是区分「加载失败」和「解析失败」的决定性证据。
+        function probeBootstrap() {
+          setTimeout(function () {
+            try {
+              var url = null;
+              var entries = performance.getEntriesByType('resource') || [];
+              for (var i = 0; i < entries.length; i++) {
+                if ((entries[i].name || '').indexOf('bootstrap') !== -1) { url = entries[i].name; break; }
+              }
+
+              if (!url) {
+                append('\n=== bootstrap \u63a2\u6d4b ===\n\u8d44\u6e90\u8bb0\u5f55\u91cc\u6ca1\u6709 bootstrap\uff0c\u8bf4\u660e\u8bf7\u6c42\u6839\u672c\u6ca1\u53d1\u51fa\u53bb\u3002');
+                return;
+              }
+
+              append('\n=== bootstrap \u63a2\u6d4b ===\nURL: ' + url.replace(location.origin, ''));
+
+              fetch(url).then(function (r) {
+                append('HTTP ' + r.status
+                  + ' | type=' + (r.headers.get('content-type') || '?')
+                  + ' | len=' + (r.headers.get('content-length') || '?'));
+                return r.text();
+              }).then(function (txt) {
+                append('\u6b63\u6587\u957f\u5ea6: ' + txt.length
+                  + '\n\u5f00\u5934 180 \u5b57\u7b26:\n' + txt.slice(0, 180));
+              }).catch(function (e) {
+                append('fetch \u5931\u8d25: ' + describe(e));
+              });
+            } catch (e) {
+              append('probe error: ' + e);
+            }
+          }, 400);
+        }
+
+        function fail(kind, detail) {
+          ensureBox(kind);
+          append(detail || '(no detail)');
+          append('\n=== \u5df2\u52a0\u8f7d\u7684\u8d44\u6e90 ===\n' + resourceReport());
+          probeBootstrap();
+        }
+
+        // 给 index.tsx 用：动态 import('./bootstrap') 失败时主动上报。
+        // 原来那句是 void import(...)，没有任何 catch，失败就是静默黑屏。
+        window.__folia_report_boot_error__ = function (err) {
+          fail('\u52a0\u8f7d bootstrap \u5931\u8d25', describe(err));
+        };
+
+        // 1) 同步错误 + 资源加载失败
+        window.addEventListener('error', function (event) {
+          var t = event && event.target;
+          if (t && t !== window && (t.tagName === 'SCRIPT' || t.tagName === 'LINK')) {
+            fail('\u8d44\u6e90\u52a0\u8f7d\u5931\u8d25', (t.tagName === 'SCRIPT' ? t.src : t.href) || '(unknown)');
+            return;
+          }
+          fail('JS \u9519\u8bef', describe((event && event.error) || (event && event.message)));
+        }, true);
+
+        // 2) 未捕获的 Promise
+        window.addEventListener('unhandledrejection', function (event) {
+          fail('Promise \u672a\u6355\u83b7', describe(event && event.reason));
+        });
+
+        // 3) 兜底：12 秒后如果 #root 还是空的，说明 React 根本没挂上
+        //    （只在页面可见时判定，避免 App 启动瞬间在后台被误报）
+        window.addEventListener('load', function () {
+          setTimeout(function () {
+            if (shown) { return; }
+            if (document.visibilityState && document.visibilityState !== 'visible') { return; }
+            var root = document.getElementById('root');
+            if (!root || root.childElementCount === 0) {
+              fail(
+                'React \u6ca1\u6709\u6e32\u67d3\u4efb\u4f55\u5185\u5bb9',
+                'location: ' + location.href + '\n'
+                + 'readyState: ' + document.readyState + '\n'
+                + 'scripts: ' + document.scripts.length
+              );
+            }
+          }, 12000);
+        });
+      })();
+    </script>
+  <script type="importmap">
+{
+  "imports": {
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.30.0",
+    "react/": "https://aistudiocdn.com/react@^19.2.0/",
+    "react": "https://aistudiocdn.com/react@^19.2.0",
+    "framer-motion": "https://aistudiocdn.com/framer-motion@^12.23.24",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
+    "lucide-react": "https://aistudiocdn.com/lucide-react@^0.554.0",
+    "react-i18next": "https://aistudiocdn.com/react-i18next@^16.3.5",
+    "i18next": "https://aistudiocdn.com/i18next@^25.6.3"
+  }
+}
+</script>
+    <!-- 首屏加载遮罩：内联样式，随 HTML 首帧一起绘制，不等 index.css 与 JS bundle。
+         由 src/utils/appSplash.ts 在 React 挂载后淡出并移除。 -->
+    <style>
+      html,
+      body {
+        background-color: #09090b;
+      }
+
+      #app-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background-color: #09090b;
+        font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+        transition: opacity 320ms ease;
+      }
+
+      #app-splash.is-hiding {
+        opacity: 0;
+        pointer-events: none;
+      }
+
+      #app-splash .app-splash-inner {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 28px;
+        opacity: 0;
+        /* 延迟淡入：命中缓存的秒开不会闪一下遮罩内容。 */
+        animation: app-splash-in 420ms ease 180ms forwards;
+      }
+
+      #app-splash .app-splash-title {
+        /* 巨大字号，随视口收缩，窄屏也不会溢出。 */
+        font-size: clamp(64px, 17vw, 200px);
+        font-weight: 600;
+        line-height: 1;
+        letter-spacing: 0.06em;
+        text-indent: 0.06em;
+      }
+
+      /* 每个字母占一个固定宽度的盒子（宽度由脚本按各字体的最大字宽测出来，单位 em，
+         跟着 font-size 缩放），字体来回切换时字形变但排版不抖。
+         纯白 + text-shadow 辉光，辉光强度由脚本逐字母随机，这里的值是脚本失败时的兜底。 */
+      #app-splash .app-splash-title span {
+        display: inline-block;
+        text-align: center;
+        font-family: inherit;
+        color: #ffffff;
+        text-shadow: 0 0 8px rgba(255, 255, 255, 0.55), 0 0 28px rgba(255, 255, 255, 0.3);
+        /* 缩放原点压到基线附近，字母大小浮动时底边大致对齐。 */
+        transform-origin: center 78%;
+      }
+
+      /* 循环波形：每根竖条只做 transform 动画，合成器线程执行，不占主线程。 */
+      #app-splash .app-splash-wave {
+        display: flex;
+        align-items: center;
+        gap: clamp(6px, 1.1vw, 11px);
+        height: clamp(42px, 7.5vw, 92px);
+      }
+
+      /* --floor / --peak / --alpha / --glow / --w 由下面的内联脚本逐条随机化；
+         这里的默认值是脚本失败时的静态兜底。纯白平涂 + 外发光，不做渐变。 */
+      #app-splash .app-splash-wave span {
+        width: var(--w, 5px);
+        height: 100%;
+        transform: scaleY(var(--floor, 0.18));
+        background-color: rgba(255, 255, 255, var(--alpha, 0.85));
+        box-shadow: 0 0 var(--glow, 14px) rgba(255, 255, 255, 0.35);
+        animation: app-splash-wave 1100ms ease-in-out infinite;
+      }
+
+      #app-splash .app-splash-wave span:nth-child(even) {
+        animation-delay: -550ms;
+      }
+
+      @keyframes app-splash-in {
+        to {
+          opacity: 1;
+        }
+      }
+
+      @keyframes app-splash-wave {
+        0%,
+        100% {
+          transform: scaleY(var(--floor, 0.18));
+        }
+        50% {
+          transform: scaleY(var(--peak, 1));
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        #app-splash .app-splash-inner {
+          opacity: 1;
+          animation: none;
+        }
+
+        #app-splash .app-splash-wave span {
+          /* 不动，但保留随机高度，静态波形仍然有形状。 */
+          transform: scaleY(calc(var(--peak, 0.5) * 0.7));
+          animation: none;
+          opacity: 0.5;
+        }
+      }
+    </style>
+</head>
+  <body>
+    <div id="app-splash" role="status" aria-live="polite" aria-label="Loading Folia">
+      <div class="app-splash-inner">
+        <div class="app-splash-title" aria-label="Folia"><span>F</span><span>o</span><span>l</span><span>i</span><span>a</span></div>
+        <div class="app-splash-wave" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+          <span></span>
+        </div>
+      </div>
+    </div>
+    <script>
+      (function () {
+        try {
+          // 需要透明背景的入口不能盖遮罩：OBS 浏览器源会被直接推流捕获，
+          // Electron 的透明播放背景 / 壁纸窗口（main.cjs 传 splash=0）会在桌面上闪一个黑块。
+          var params = new URLSearchParams(window.location.search);
+          if (params.get('obs') === '1' || window.location.pathname === '/obs' || params.get('splash') === '0') {
+            var splash = document.getElementById('app-splash');
+            if (splash) {
+              splash.remove();
+            }
+            return;
+          }
+        } catch (error) {
+          // 探测失败时保留遮罩，React 挂载后仍会移除它。
+        }
+
+        // 波形逐条随机化：高度、宽度、节奏、相位和颜色都带抖动，每次加载的形状都不一样。
+        // 同步执行，在首帧绘制前完成；失败时 CSS 里的默认值会兜底成一条静态波形。
+        try {
+          var rand = function (min, max) {
+            return min + Math.random() * (max - min);
+          };
+
+          var bars = document.querySelectorAll('#app-splash .app-splash-wave span');
+          for (var i = 0; i < bars.length; i += 1) {
+            var bar = bars[i];
+            // 中间高、两端低的整体包络，再叠加随机量，形状既像波形又不规整。
+            var envelope = Math.sin(((i + 0.5) / bars.length) * Math.PI);
+            var peak = Math.min(1, 0.32 + envelope * rand(0.38, 0.72));
+            bar.style.setProperty('--peak', peak.toFixed(3));
+            bar.style.setProperty('--floor', rand(0.08, 0.24).toFixed(3));
+            bar.style.setProperty('--w', rand(3.5, 6.5).toFixed(2) + 'px');
+            // 白色平涂，只在亮度和辉光半径上留随机：高的条更亮、光晕更散。
+            bar.style.setProperty('--alpha', rand(0.55, 1).toFixed(2));
+            bar.style.setProperty('--glow', Math.round(rand(6, 26)) + 'px');
+            bar.style.animationDuration = Math.round(rand(820, 1500)) + 'ms';
+            bar.style.animationDelay = '-' + Math.round(rand(0, 1500)) + 'ms';
+          }
+        } catch (error) {
+          // 随机化失败无所谓，CSS 默认值已经能跑一条波形。
+        }
+
+        // Folia 五个字母不断跳到不同字形（Loki 片头那种字体轮盘），偶尔整体落回基准样式。
+        // 只用通用字族，再叠加字重、斜体和横向拉伸——不同机器上装的字体不一样，
+        // 单靠字体名会退化成同一张脸，加上这几个轴才保证每次跳变都看得出来。
+        try {
+          if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+            return;
+          }
+          var BASE_FONT = "'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif";
+          var FAMILIES = [BASE_FONT, 'serif', 'monospace', 'cursive', 'fantasy', 'system-ui'];
+          var WEIGHTS = ['400', '600', '800'];
+          var SCALES = [0.86, 0.94, 1, 1.06, 1.12];
+          var letters = document.querySelectorAll('#app-splash .app-splash-title span');
+          if (!letters.length) {
+            return;
+          }
+
+          // 用 canvas 在 100px 基准下量出每个字母在所有候选字形里的最大宽度，换算成 em 写死盒子宽度，
+          // 这样字形来回换、词标整体不会左右乱跳。
+          var measure = document.createElement('canvas').getContext('2d');
+          for (var m = 0; m < letters.length; m += 1) {
+            var glyph = letters[m].textContent;
+            var widest = 0;
+            for (var f = 0; f < FAMILIES.length; f += 1) {
+              measure.font = 'italic 800 100px ' + FAMILIES[f];
+              widest = Math.max(widest, measure.measureText(glyph).width);
+              measure.font = '800 100px ' + FAMILIES[f];
+              widest = Math.max(widest, measure.measureText(glyph).width);
+            }
+            if (widest > 0) {
+              // 余量留给最大的缩放组合（1.12 × 1.12），字形放大时不会压到相邻字母。
+              letters[m].style.width = ((widest / 100) * 1.26 + 0.04).toFixed(3) + 'em';
+            }
+          }
+
+          var pick = function (list) {
+            return list[Math.floor(Math.random() * list.length)];
+          };
+          var jitter = function (min, max) {
+            return min + Math.random() * (max - min);
+          };
+          // 辉光分三档：干净、微光、过曝。片头里字母亮度参差不齐，靠这个模拟。
+          var randomGlow = function () {
+            var roll = Math.random();
+            if (roll < 0.3) {
+              return '0 0 ' + (2 + Math.random() * 4).toFixed(1) + 'px rgba(255,255,255,0.35)';
+            }
+            if (roll < 0.75) {
+              return '0 0 ' + (6 + Math.random() * 8).toFixed(1) + 'px rgba(255,255,255,0.7), 0 0 ' +
+                (20 + Math.random() * 16).toFixed(1) + 'px rgba(255,255,255,0.35)';
+            }
+            return '0 0 ' + (10 + Math.random() * 8).toFixed(1) + 'px rgba(255,255,255,0.95), 0 0 ' +
+              (34 + Math.random() * 20).toFixed(1) + 'px rgba(255,255,255,0.7), 0 0 ' +
+              (70 + Math.random() * 40).toFixed(1) + 'px rgba(255,255,255,0.45)';
+          };
+          var timer = window.setInterval(function () {
+            // 遮罩被移除后自己停掉，不留空转的定时器。
+            if (!document.getElementById('app-splash')) {
+              window.clearInterval(timer);
+              return;
+            }
+            // 一拍只换一个字母，偶尔两个，节奏克制。
+            var swaps = Math.random() < 0.25 ? 2 : 1;
+            for (var i = 0; i < swaps; i += 1) {
+              var letter = pick(letters);
+              letter.style.fontFamily = pick(FAMILIES);
+              letter.style.fontWeight = pick(WEIGHTS);
+              letter.style.fontStyle = Math.random() < 0.25 ? 'italic' : 'normal';
+              // 大小和宽窄都用 transform 做：不进入布局，盒子宽度不受影响，排版才不会抖。
+              var sizeScale = jitter(0.86, 1.12);
+              letter.style.transform =
+                'scale(' + (sizeScale * pick(SCALES)).toFixed(3) + ',' + sizeScale.toFixed(3) + ')';
+              letter.style.textShadow = randomGlow();
+            }
+          }, 380);
+        } catch (error) {
+          // 字体轮盘失败就保持静态词标。
+        }
+      })();
+    </script>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>
