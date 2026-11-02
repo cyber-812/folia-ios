@@ -72,7 +72,6 @@ jobs:
 
       - name: Generate iOS assets (non-blocking)
         working-directory: /tmp/app
-        continue-on-error: true
         run: node scripts/generate-ios-assets.mjs
 
       - name: Apply Info.plist entries
