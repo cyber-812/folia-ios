@@ -40,6 +40,29 @@ def disk():
 def svc(name):
     return os.system("systemctl is-active --quiet " + name) == 0
 
+def listening(proto, port):
+    hexport = "%04X" % port
+    try:
+        with open("/proc/net/" + proto) as f:
+            lines = f.read().splitlines()[1:]
+    except OSError:
+        return False
+    for ln in lines:
+        parts = ln.split()
+        if len(parts) > 3 and parts[1].endswith(":" + hexport):
+            if proto == "udp" or parts[3] == "0A":
+                return True
+    return False
+
+def egress_ms():
+    t0 = time.time()
+    try:
+        req = urllib.request.Request("https://www.google.com/generate_204")
+        urllib.request.urlopen(req, timeout=6).read()
+        return int((time.time() - t0) * 1000)
+    except Exception:
+        return -1
+
 def main():
     with open("/proc/uptime") as f:
         up = int(float(f.read().split()[0]))
@@ -51,7 +74,9 @@ def main():
             "disk_pct": dp, "disk_used": du, "disk_total": dt,
             "up_days": round(up / 86400, 1), "load": load,
             "singbox": svc("sing-box"), "agh": svc("AdGuardHome"),
-            "watch": svc("agh-watch"), "ts": int(time.time())}
+            "watch": svc("agh-watch"),
+            "hy2": listening("udp", 443), "reality": listening("tcp", 443),
+            "egress_ms": egress_ms(), "ts": int(time.time())}
     body = json.dumps({"topic": TOPIC, "title": "tokyo-status",
                        "message": json.dumps(data)}).encode()
     req = urllib.request.Request("https://ntfy.sh/", data=body,
