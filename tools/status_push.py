@@ -42,16 +42,17 @@ def svc(name):
 
 def listening(proto, port):
     hexport = "%04X" % port
-    try:
-        with open("/proc/net/" + proto) as f:
-            lines = f.read().splitlines()[1:]
-    except OSError:
-        return False
-    for ln in lines:
-        parts = ln.split()
-        if len(parts) > 3 and parts[1].endswith(":" + hexport):
-            if proto == "udp" or parts[3] == "0A":
-                return True
+    for suffix in ("", "6"):
+        try:
+            with open("/proc/net/" + proto + suffix) as f:
+                lines = f.read().splitlines()[1:]
+        except OSError:
+            continue
+        for ln in lines:
+            parts = ln.split()
+            if len(parts) > 3 and parts[1].endswith(":" + hexport):
+                if proto == "udp" or parts[3] == "0A":
+                    return True
     return False
 
 def egress_ms():
