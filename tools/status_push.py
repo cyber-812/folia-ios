@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json, os, time, urllib.request
+from datetime import datetime, timedelta, timezone
 
 BASE = "/opt/agh-watch"
 TOPIC = open(os.path.join(BASE, "status_topic.txt")).read().strip()
@@ -55,6 +56,84 @@ def listening(proto, port):
                     return True
     return False
 
+def swap_pct():
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, v = line.split(":")
+                info[k.strip()] = int(v.split()[0])
+    except Exception:
+        return -1
+    total = info.get("SwapTotal", 0)
+    if total <= 0:
+        return -1
+    free = info.get("SwapFree", 0)
+    return round(100.0 * (total - free) / total, 1)
+
+def net_gb():
+    best = None
+    try:
+        with open("/proc/net/dev") as f:
+            lines = f.read().splitlines()[2:]
+    except Exception:
+        return -1, -1
+    for ln in lines:
+        if ":" not in ln:
+            continue
+        name, rest = ln.split(":", 1)
+        name = name.strip()
+        if name == "lo":
+            continue
+        nums = rest.split()
+        rx, tx = int(nums[0]), int(nums[8])
+        if best is None or rx > best[0]:
+            best = (rx, tx)
+    if best is None:
+        return -1, -1
+    return round(best[0] / 1073741824, 2), round(best[1] / 1073741824, 2)
+
+def entry_blocked(e):
+    if "0.0.0.0" in str(e.get("Answer", "")):
+        return True
+    r = e.get("Result") or {}
+    if isinstance(r, dict):
+        if r.get("Rule") or r.get("Service"):
+            return True
+        reason = str(r.get("Reason", ""))
+        return reason not in ("", "0", "NotFiltered", "Not filtered")
+    return False
+
+def agh_today():
+    path = "/opt/AdGuardHome/data/querylog.json"
+    cst = timezone(timedelta(hours=8))
+    today = datetime.now(cst).date()
+    total = 0
+    blocked = 0
+    try:
+        with open(path, errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                t = str(e.get("T", ""))
+                try:
+                    dt = datetime.strptime(t[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if dt.astimezone(cst).date() != today:
+                    continue
+                total += 1
+                if entry_blocked(e):
+                    blocked += 1
+    except Exception:
+        return -1, -1
+    return total, blocked
+
 def egress_ms():
     t0 = time.time()
     try:
@@ -71,13 +150,17 @@ def main():
         load = f.read().split()[0]
     mp, mu, mt = mem()
     dp, du, dt = disk()
+    nrx, ntx = net_gb()
+    aq, ab = agh_today()
     data = {"cpu": cpu_pct(), "mem_pct": mp, "mem_used": mu, "mem_total": mt,
             "disk_pct": dp, "disk_used": du, "disk_total": dt,
             "up_days": round(up / 86400, 1), "load": load,
             "singbox": svc("sing-box"), "agh": svc("AdGuardHome"),
             "watch": svc("agh-watch"),
             "hy2": listening("udp", 443), "reality": listening("tcp", 443),
-            "egress_ms": egress_ms(), "ts": int(time.time())}
+            "egress_ms": egress_ms(), "ts": int(time.time()),
+            "swap_pct": swap_pct(), "net_rx_gb": nrx, "net_tx_gb": ntx,
+            "agh_queries_today": aq, "agh_blocked_today": ab}
     body = json.dumps({"topic": TOPIC, "title": "tokyo-status",
                        "message": json.dumps(data)}).encode()
     req = urllib.request.Request("https://ntfy.sh/", data=body,
